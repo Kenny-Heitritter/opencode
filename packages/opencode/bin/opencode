@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
-const childProcess = require("child_process")
-const fs = require("fs")
-const path = require("path")
-const os = require("os")
+import childProcess from "child_process"
+import fs from "fs"
+import path from "path"
+import os from "os"
+import { fileURLToPath } from "url"
+
+const __filename = fileURLToPath(import.meta.url)
 
 function run(target) {
   const result = childProcess.spawnSync(target, process.argv.slice(2), {
@@ -58,6 +61,19 @@ function findBinary(startDir) {
           continue
         }
         const candidate = path.join(modules, entry, "bin", binary)
+        if (fs.existsSync(candidate)) {
+          return candidate
+        }
+      }
+    }
+    const dist = path.join(current, "dist")
+    if (fs.existsSync(dist)) {
+      const entries = fs.readdirSync(dist)
+      for (const entry of entries) {
+        if (!entry.startsWith(base)) {
+          continue
+        }
+        const candidate = path.join(dist, entry, "bin", binary)
         if (fs.existsSync(candidate)) {
           return candidate
         }
