@@ -28,6 +28,9 @@ export namespace SessionProcessor {
     abort: AbortSignal
   }) {
     const toolcalls: Record<string, MessageV2.ToolPart> = {}
+    const preserveReasoning =
+      typeof input.model.capabilities.interleaved === "object" &&
+      input.model.capabilities.interleaved.field === "reasoning_content"
     let snapshot: string | undefined
     let blocked = false
     let attempt = 0
@@ -46,6 +49,7 @@ export namespace SessionProcessor {
           try {
             let currentText: MessageV2.TextPart | undefined
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
+            let sawReasoning = false
             const stream = await LLM.stream(streamInput)
 
             for await (const value of stream.fullStream) {
@@ -56,6 +60,7 @@ export namespace SessionProcessor {
                   break
 
                 case "reasoning-start":
+                  sawReasoning = true
                   if (value.id in reasoningMap) {
                     continue
                   }
@@ -73,6 +78,7 @@ export namespace SessionProcessor {
                   break
 
                 case "reasoning-delta":
+                  sawReasoning = true
                   if (value.id in reasoningMap) {
                     const part = reasoningMap[value.id]
                     part.text += value.text
@@ -82,9 +88,12 @@ export namespace SessionProcessor {
                   break
 
                 case "reasoning-end":
+                  sawReasoning = true
                   if (value.id in reasoningMap) {
                     const part = reasoningMap[value.id]
-                    part.text = part.text.trimEnd()
+                    if (!preserveReasoning) {
+                      part.text = part.text.trimEnd()
+                    }
 
                     part.time = {
                       ...part.time,
@@ -309,6 +318,41 @@ export namespace SessionProcessor {
 
                 case "text-end":
                   if (currentText) {
+                    if (
+                      !sawReasoning &&
+                      input.model.capabilities.reasoning &&
+                      currentText.text.includes("</think>")
+                    ) {
+                      const openTag = "<think>"
+                      const closeTag = "</think>"
+                      const openIdx = currentText.text.indexOf(openTag)
+                      const closeIdx = currentText.text.indexOf(closeTag)
+                      if (closeIdx !== -1) {
+                        const reasoningText =
+                          openIdx !== -1 && openIdx < closeIdx
+                            ? currentText.text.slice(openIdx + openTag.length, closeIdx)
+                            : currentText.text.slice(0, closeIdx)
+                        const remainingText =
+                          openIdx !== -1 && openIdx < closeIdx
+                            ? currentText.text.slice(0, openIdx) + currentText.text.slice(closeIdx + closeTag.length)
+                            : currentText.text.slice(closeIdx + closeTag.length)
+                        if (reasoningText) {
+                          await Session.updatePart({
+                            id: Identifier.ascending("part"),
+                            messageID: input.assistantMessage.id,
+                            sessionID: input.assistantMessage.sessionID,
+                            type: "reasoning",
+                            text: reasoningText,
+                            time: {
+                              start: currentText.time?.start ?? Date.now(),
+                              end: Date.now(),
+                            },
+                          })
+                          currentText.text = remainingText
+                          sawReasoning = true
+                        }
+                      }
+                    }
                     currentText.text = currentText.text.trimEnd()
                     const textOutput = await Plugin.trigger(
                       "experimental.text.complete",
