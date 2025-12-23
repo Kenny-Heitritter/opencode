@@ -17,7 +17,7 @@
     "deploy": "echo 'Deploying application...' && bun run build && echo 'Deployment completed successfully'"
   },
   "bin": {
-    "opencode": "./bin/opencode"
+    "opencode": "./bin/opencode.js"
   },
   "exports": {
     "./*": "./src/*.ts"
