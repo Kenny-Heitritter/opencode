@@ -259,7 +259,7 @@ export namespace ProviderTransform {
 
     if (
       model.providerID === "baseten" ||
-      (model.providerID === "opencode" && ["kimi-k2-thinking", "glm-4.6"].includes(model.api.id))
+      (model.providerID === "opencode" && ["kimi-k2-thinking", "glm-4.6", "glm-4.7"].includes(model.api.id))
     ) {
       result["chat_template_args"] = { enable_thinking: true }
     }

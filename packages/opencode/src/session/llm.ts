@@ -1,6 +1,14 @@
 import { Provider } from "@/provider/provider"
 import { Log } from "@/util/log"
-import { streamText, wrapLanguageModel, type ModelMessage, type StreamTextResult, type Tool, type ToolSet } from "ai"
+import {
+  generateText,
+  streamText,
+  wrapLanguageModel,
+  type ModelMessage,
+  type StreamTextResult,
+  type Tool,
+  type ToolSet,
+} from "ai"
 import { clone, mergeDeep, pipe } from "remeda"
 import { ProviderTransform } from "@/provider/transform"
 import { Config } from "@/config/config"
@@ -28,6 +36,12 @@ export namespace LLM {
     small?: boolean
     tools: Record<string, Tool>
     retries?: number
+
+    /**
+     * For OpenAI Responses API multi-step flows, pass the previous response ID
+     * so tool outputs can be attached to the correct tool calls.
+     */
+    previousResponseId?: string
   }
 
   export type StreamOutput = StreamTextResult<ToolSet, unknown>
@@ -90,19 +104,40 @@ export namespace LLM {
           : undefined,
         topP: input.agent.topP ?? ProviderTransform.topP(input.model),
         topK: ProviderTransform.topK(input.model),
-        options: pipe(
-          {},
-          mergeDeep(ProviderTransform.options(input.model, input.sessionID, provider.options)),
-          input.small ? mergeDeep(ProviderTransform.smallOptions(input.model)) : mergeDeep({}),
-          mergeDeep(input.model.options),
-          mergeDeep(input.agent.options),
-        ),
+        options: (() => {
+          const mergeAny = mergeDeep as unknown as (a: any, b: any) => any
+          let options: any = {}
+
+          options = mergeAny(options, ProviderTransform.options(input.model, input.sessionID, provider.options))
+
+          // Disable parallel tool calls for GLM models to improve reliability
+          if (input.model.id.includes("glm-") || input.model.api.id.includes("glm-")) {
+            options = mergeAny(options, { parallelToolCalls: false })
+          }
+
+          if (input.small) {
+            options = mergeAny(options, ProviderTransform.smallOptions(input.model))
+          }
+
+          options = mergeAny(options, input.model.options)
+          options = mergeAny(options, input.agent.options)
+          return options
+        })(),
       },
     )
 
     l.info("params", {
       params,
     })
+
+    if (
+      input.previousResponseId &&
+      (input.model.api.npm === "@ai-sdk/openai" || input.model.api.npm === "@ai-sdk/azure")
+    ) {
+      // Avoid remeda.mergeDeep here to prevent TS deep instantiation
+      ;(params.options as any).previousResponseId = input.previousResponseId
+      ;(params.options as any).store = true
+    }
 
     const maxOutputTokens = ProviderTransform.maxOutputTokens(
       input.model.api.npm,
@@ -113,6 +148,99 @@ export namespace LLM {
 
     const tools = await resolveTools(input)
 
+    const messages: ModelMessage[] = [
+      ...system.map(
+        (x): ModelMessage => ({
+          role: "system",
+          content: x,
+        }),
+      ),
+      ...input.messages,
+    ]
+
+    const providerOptions = ProviderTransform.providerOptions(input.model, params.options)
+    const activeTools = Object.keys(tools).filter((x) => x !== "invalid")
+
+    const wrappedModel = wrapLanguageModel({
+      model: language,
+      middleware: [
+        {
+          async transformParams(args) {
+            if (args.type === "stream" || args.type === "generate") {
+              // @ts-expect-error
+              args.params.prompt = ProviderTransform.message(args.params.prompt, input.model)
+            }
+            return args.params
+          },
+        },
+      ],
+    })
+
+    // vLLM OpenAI-compatible endpoints sometimes do not include tool calls in streaming mode
+    // even when the model emits a tool call marker. Fall back to a single non-streaming request
+    // and let SessionProcessor extract/execute tool calls from the returned text.
+    const baseURL = (provider.options as any)?.baseURL
+    const useNonStreaming =
+      input.model.api.npm === "@ai-sdk/openai-compatible" &&
+      typeof baseURL === "string" &&
+      baseURL.includes("/api/vllm/")
+
+    if (useNonStreaming) {
+      const result = await generateText({
+        temperature: params.temperature,
+        topP: params.topP,
+        topK: params.topK,
+        providerOptions,
+        activeTools,
+        tools,
+        maxOutputTokens,
+        abortSignal: input.abort,
+        headers: {
+          ...(input.model.providerID.startsWith("opencode")
+            ? {
+                "x-opencode-project": Instance.project.id,
+                "x-opencode-session": input.sessionID,
+                "x-opencode-request": input.user.id,
+                "x-opencode-client": Flag.OPENCODE_CLIENT,
+              }
+            : undefined),
+          ...input.model.headers,
+        },
+        maxRetries: input.retries ?? 0,
+        messages,
+        model: wrappedModel,
+        experimental_telemetry: { isEnabled: cfg.experimental?.openTelemetry },
+      })
+
+      const fullStream = (async function* () {
+        yield { type: "start" as const }
+        yield { type: "start-step" as const }
+
+        if (result.reasoningText) {
+          const id = "reasoning_" + crypto.randomUUID().replace(/-/g, "")
+          yield { type: "reasoning-start" as const, id }
+          yield { type: "reasoning-delta" as const, id, text: result.reasoningText }
+          yield { type: "reasoning-end" as const, id }
+        }
+
+        yield { type: "text-start" as const }
+        if (result.text) {
+          yield { type: "text-delta" as const, text: result.text }
+        }
+        yield { type: "text-end" as const }
+
+        yield {
+          type: "finish-step" as const,
+          finishReason: result.finishReason,
+          usage: result.usage,
+          providerMetadata: result.providerMetadata,
+        }
+        yield { type: "finish" as const }
+      })()
+
+      return { fullStream } as any
+    }
+
     return streamText({
       onError(error) {
         l.error("stream error", {
@@ -120,17 +248,26 @@ export namespace LLM {
         })
       },
       async experimental_repairToolCall(failed) {
-        const lower = failed.toolCall.toolName.toLowerCase()
-        if (lower !== failed.toolCall.toolName && tools[lower]) {
-          l.info("repairing tool call", {
-            tool: failed.toolCall.toolName,
-            repaired: lower,
-          })
-          return {
-            ...failed.toolCall,
-            toolName: lower,
+        const candidates = [
+          failed.toolCall.toolName,
+          failed.toolCall.toolName.toLowerCase(),
+          failed.toolCall.toolName.replace(/[^a-zA-Z0-9_]/g, "_"),
+          failed.toolCall.toolName.toLowerCase().replace(/[^a-zA-Z0-9_]/g, "_"),
+        ]
+
+        for (const candidate of candidates) {
+          if (candidate !== failed.toolCall.toolName && tools[candidate]) {
+            l.info("repairing tool call", {
+              tool: failed.toolCall.toolName,
+              repaired: candidate,
+            })
+            return {
+              ...failed.toolCall,
+              toolName: candidate,
+            }
           }
         }
+
         return {
           ...failed.toolCall,
           input: JSON.stringify({
@@ -143,8 +280,8 @@ export namespace LLM {
       temperature: params.temperature,
       topP: params.topP,
       topK: params.topK,
-      providerOptions: ProviderTransform.providerOptions(input.model, params.options),
-      activeTools: Object.keys(tools).filter((x) => x !== "invalid"),
+      providerOptions,
+      activeTools,
       tools,
       maxOutputTokens,
       abortSignal: input.abort,
@@ -160,29 +297,8 @@ export namespace LLM {
         ...input.model.headers,
       },
       maxRetries: input.retries ?? 0,
-      messages: [
-        ...system.map(
-          (x): ModelMessage => ({
-            role: "system",
-            content: x,
-          }),
-        ),
-        ...input.messages,
-      ],
-      model: wrapLanguageModel({
-        model: language,
-        middleware: [
-          {
-            async transformParams(args) {
-              if (args.type === "stream") {
-                // @ts-expect-error
-                args.params.prompt = ProviderTransform.message(args.params.prompt, input.model)
-              }
-              return args.params
-            },
-          },
-        ],
-      }),
+      messages,
+      model: wrappedModel,
       experimental_telemetry: { isEnabled: cfg.experimental?.openTelemetry },
     })
   }

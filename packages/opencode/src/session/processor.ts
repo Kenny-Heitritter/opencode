@@ -50,6 +50,154 @@ export namespace SessionProcessor {
             let currentText: MessageV2.TextPart | undefined
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
             let sawReasoning = false
+            let sawSyntheticToolCall = false
+
+            const parseTaggedToolCalls = (
+              text: string,
+            ): { cleaned: string; calls: Array<{ name: string; args: any }> } => {
+              const openTag = "<tool_call>"
+              const closeTag = "</tool_call>"
+              if (!text.includes(openTag)) return { cleaned: text, calls: [] }
+
+              const calls: Array<{ name: string; args: any }> = []
+              let cleaned = text
+
+              const re = /<tool_call>([\s\S]*?)<\/tool_call>/g
+              let match: RegExpExecArray | null
+              while ((match = re.exec(text)) !== null) {
+                const inner = (match[1] ?? "").trim()
+                if (!inner) continue
+
+                let name = ""
+                let args: any = {}
+
+                // Try JSON-first
+                if (inner.startsWith("{")) {
+                  try {
+                    const parsed = JSON.parse(inner)
+                    if (parsed && typeof parsed === "object") {
+                      if (typeof (parsed as any).name === "string") {
+                        name = (parsed as any).name
+                        args = (parsed as any).arguments ?? {}
+                      } else if (typeof (parsed as any).tool === "string") {
+                        name = (parsed as any).tool
+                        args = (parsed as any).arguments ?? {}
+                      }
+                    }
+                  } catch {
+                    // fall back to token parsing
+                  }
+                }
+
+                if (!name) {
+                  const firstSpace = inner.search(/\s/)
+                  if (firstSpace === -1) {
+                    name = inner
+                  } else {
+                    name = inner.slice(0, firstSpace)
+                    const rest = inner.slice(firstSpace).trim()
+                    if (rest) {
+                      try {
+                        args = JSON.parse(rest)
+                      } catch {
+                        args = {}
+                      }
+                    }
+                  }
+                }
+
+                if (name) {
+                  calls.push({ name, args })
+                }
+              }
+
+              cleaned = cleaned.replace(re, "").trim()
+              return { cleaned, calls }
+            }
+
+            const resolveToolName = (name: string) => {
+              const candidates = [
+                name,
+                name.toLowerCase(),
+                name.replace(/[^a-zA-Z0-9_]/g, "_"),
+                name.toLowerCase().replace(/[^a-zA-Z0-9_]/g, "_"),
+              ]
+              return candidates.find((c) => c in streamInput.tools)
+            }
+
+            const executeSyntheticToolCalls = async (calls: Array<{ name: string; args: any }>) => {
+              for (const call of calls) {
+                const toolName = resolveToolName(call.name)
+                if (!toolName) continue
+
+                const toolCallId = "call_" + crypto.randomUUID().replace(/-/g, "")
+                const start = Date.now()
+
+                const part = await Session.updatePart({
+                  id: Identifier.ascending("part"),
+                  messageID: input.assistantMessage.id,
+                  sessionID: input.assistantMessage.sessionID,
+                  type: "tool",
+                  tool: toolName,
+                  callID: toolCallId,
+                  state: {
+                    status: "running",
+                    input: call.args ?? {},
+                    time: {
+                      start,
+                    },
+                  },
+                })
+
+                toolcalls[toolCallId] = part as MessageV2.ToolPart
+
+                try {
+                  const output = await (streamInput.tools as any)[toolName].execute(call.args ?? {}, {
+                    toolCallId,
+                    abortSignal: input.abort,
+                  })
+
+                  await Session.updatePart({
+                    ...(part as any),
+                    state: {
+                      status: "completed",
+                      input: call.args ?? {},
+                      output: output.output,
+                      metadata: output.metadata,
+                      title: output.title,
+                      time: {
+                        start,
+                        end: Date.now(),
+                      },
+                      attachments: output.attachments,
+                    },
+                  })
+
+                  sawSyntheticToolCall = true
+                } catch (error) {
+                  await Session.updatePart({
+                    ...(part as any),
+                    state: {
+                      status: "error",
+                      input: call.args ?? {},
+                      error: (error as any).toString(),
+                      metadata: error instanceof Permission.RejectedError ? error.metadata : undefined,
+                      time: {
+                        start,
+                        end: Date.now(),
+                      },
+                    },
+                  })
+
+                  if (error instanceof Permission.RejectedError) {
+                    blocked = shouldBreak
+                  }
+                } finally {
+                  delete toolcalls[toolCallId]
+                }
+              }
+            }
+
             const stream = await LLM.stream(streamInput)
 
             for await (const value of stream.fullStream) {
@@ -91,6 +239,13 @@ export namespace SessionProcessor {
                   sawReasoning = true
                   if (value.id in reasoningMap) {
                     const part = reasoningMap[value.id]
+
+                    const tagged = parseTaggedToolCalls(part.text)
+                    if (tagged.calls.length) {
+                      await executeSyntheticToolCalls(tagged.calls)
+                      part.text = tagged.cleaned
+                    }
+
                     if (!preserveReasoning) {
                       part.text = part.text.trimEnd()
                     }
@@ -256,18 +411,22 @@ export namespace SessionProcessor {
                     usage: value.usage,
                     metadata: value.providerMetadata,
                   })
-                  input.assistantMessage.finish = value.finishReason
+                  const finishReason = sawSyntheticToolCall ? "tool-calls" : value.finishReason
+
+                  input.assistantMessage.finish = finishReason
                   input.assistantMessage.cost += usage.cost
                   input.assistantMessage.tokens = usage.tokens
                   await Session.updatePart({
                     id: Identifier.ascending("part"),
-                    reason: value.finishReason,
+                    reason: finishReason,
+
                     snapshot: await Snapshot.track(),
                     messageID: input.assistantMessage.id,
                     sessionID: input.assistantMessage.sessionID,
                     type: "step-finish",
                     tokens: usage.tokens,
                     cost: usage.cost,
+                    metadata: value.providerMetadata,
                   })
                   await Session.updateMessage(input.assistantMessage)
                   if (snapshot) {
@@ -318,11 +477,7 @@ export namespace SessionProcessor {
 
                 case "text-end":
                   if (currentText) {
-                    if (
-                      !sawReasoning &&
-                      input.model.capabilities.reasoning &&
-                      currentText.text.includes("</think>")
-                    ) {
+                    if (!sawReasoning && input.model.capabilities.reasoning && currentText.text.includes("</think>")) {
                       const openTag = "<think>"
                       const closeTag = "</think>"
                       const openIdx = currentText.text.indexOf(openTag)
@@ -353,6 +508,12 @@ export namespace SessionProcessor {
                         }
                       }
                     }
+                    const tagged = parseTaggedToolCalls(currentText.text)
+                    if (tagged.calls.length) {
+                      await executeSyntheticToolCalls(tagged.calls)
+                      currentText.text = tagged.cleaned
+                    }
+
                     currentText.text = currentText.text.trimEnd()
                     const textOutput = await Plugin.trigger(
                       "experimental.text.complete",

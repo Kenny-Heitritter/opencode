@@ -247,14 +247,19 @@ export namespace SessionPrompt {
 
       let lastUser: MessageV2.User | undefined
       let lastAssistant: MessageV2.Assistant | undefined
+      let lastAssistantMsg: MessageV2.WithParts | undefined
       let lastFinished: MessageV2.Assistant | undefined
       let tasks: (MessageV2.CompactionPart | MessageV2.SubtaskPart)[] = []
       for (let i = msgs.length - 1; i >= 0; i--) {
         const msg = msgs[i]
         if (!lastUser && msg.info.role === "user") lastUser = msg.info as MessageV2.User
-        if (!lastAssistant && msg.info.role === "assistant") lastAssistant = msg.info as MessageV2.Assistant
-        if (!lastFinished && msg.info.role === "assistant" && msg.info.finish)
+        if (!lastAssistant && msg.info.role === "assistant") {
+          lastAssistant = msg.info as MessageV2.Assistant
+          lastAssistantMsg = msg
+        }
+        if (!lastFinished && msg.info.role === "assistant" && msg.info.finish) {
           lastFinished = msg.info as MessageV2.Assistant
+        }
         if (lastUser && lastFinished) break
         const task = msg.parts.filter((part) => part.type === "compaction" || part.type === "subtask")
         if (task && !lastFinished) {
@@ -263,11 +268,12 @@ export namespace SessionPrompt {
       }
 
       if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
-      if (
-        lastAssistant?.finish &&
-        !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-        lastUser.id < lastAssistant.id
-      ) {
+
+      const hasToolParts = lastAssistantMsg?.parts.some((p) => p.type === "tool")
+      const shouldContinue =
+        lastAssistant?.finish === "unknown" || (lastAssistant?.finish === "tool-calls" && hasToolParts)
+
+      if (lastAssistant?.finish && !shouldContinue && lastUser.id < lastAssistant.id) {
         log.info("exiting loop", { sessionID })
         break
       }
@@ -527,11 +533,24 @@ export namespace SessionPrompt {
 
       await Plugin.trigger("experimental.chat.messages.transform", {}, { messages: sessionMessages })
 
+      const previousResponseId = (() => {
+        if (lastAssistant?.finish !== "tool-calls") return
+        if (model.api.npm !== "@ai-sdk/openai" && model.api.npm !== "@ai-sdk/azure") return
+
+        const finishParts = (lastAssistantMsg?.parts ?? []).filter(
+          (p): p is MessageV2.StepFinishPart => p.type === "step-finish",
+        )
+        const lastFinish = finishParts[finishParts.length - 1]
+        const responseId = (lastFinish?.metadata as any)?.openai?.responseId
+        return typeof responseId === "string" ? responseId : undefined
+      })()
+
       const result = await processor.process({
         user: lastUser,
         agent,
         abort,
         sessionID,
+        previousResponseId,
         system: [...(await SystemPrompt.environment()), ...(await SystemPrompt.custom())],
         messages: [
           ...MessageV2.toModelMessage(sessionMessages),
@@ -646,8 +665,15 @@ export namespace SessionPrompt {
         },
       })
     }
+    const normalizeMcpToolNamesForGlm =
+      input.model.api.npm === "@ai-sdk/openai-compatible" &&
+      (input.model.id.includes("glm-") || input.model.api.id.includes("glm-"))
+
     for (const [key, item] of Object.entries(await MCP.tools())) {
-      if (Wildcard.all(key, enabledTools) === false) continue
+      const normalizedKey = normalizeMcpToolNamesForGlm ? key.replace(/[^a-zA-Z0-9_]/g, "_") : key
+      if (Wildcard.all(key, enabledTools) === false && Wildcard.all(normalizedKey, enabledTools) === false) continue
+
+      const exposedKey = normalizedKey
       const execute = item.execute
       if (!execute) continue
 
@@ -656,7 +682,7 @@ export namespace SessionPrompt {
         await Plugin.trigger(
           "tool.execute.before",
           {
-            tool: key,
+            tool: exposedKey,
             sessionID: input.sessionID,
             callID: opts.toolCallId,
           },
@@ -669,7 +695,7 @@ export namespace SessionPrompt {
         await Plugin.trigger(
           "tool.execute.after",
           {
-            tool: key,
+            tool: exposedKey,
             sessionID: input.sessionID,
             callID: opts.toolCallId,
           },
@@ -709,7 +735,7 @@ export namespace SessionPrompt {
           value: result.output,
         }
       }
-      tools[key] = item
+      tools[exposedKey] = item
     }
     return tools
   }
@@ -1436,7 +1462,10 @@ export namespace SessionPrompt {
         ]),
       ],
     })
-    const text = await result.text.catch((err) => log.error("failed to generate title", { error: err }))
+    const text = await (result.text as Promise<string>).catch((err: unknown) => {
+      log.error("failed to generate title", { error: err })
+      return undefined
+    })
     if (text)
       return Session.update(input.session.id, (draft) => {
         const cleaned = text

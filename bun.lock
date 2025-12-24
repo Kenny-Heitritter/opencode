@@ -227,7 +227,7 @@
       "name": "opencode",
       "version": "1.0.190",
       "bin": {
-        "opencode": "./bin/opencode",
+        "opencode": "./bin/opencode.js",
       },
       "dependencies": {
         "@actions/core": "1.11.1",

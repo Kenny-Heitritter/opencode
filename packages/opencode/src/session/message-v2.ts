@@ -198,6 +198,8 @@ export namespace MessageV2 {
         write: z.number(),
       }),
     }),
+    // Provider metadata for step-level state (e.g. OpenAI responseId)
+    metadata: z.record(z.string(), z.any()).optional(),
   }).meta({
     ref: "StepFinishPart",
   })
